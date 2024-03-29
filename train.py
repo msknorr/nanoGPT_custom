@@ -35,7 +35,7 @@ from model import GPTConfig, GPT
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-eval_iters = 200
+eval_iters = 200  #todo: increase
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -217,14 +217,18 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    datasets = ['train', 'val'] if dataset != 'enwik8_char' else ['train', 'val', 'test']
+    for split in datasets:
         losses = torch.zeros(eval_iters)
+        bpcs = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss, bpc = model(X, Y)
             losses[k] = loss.item()
+            bpcs[k] = bpc.item()
         out[split] = losses.mean()
+        out[split + '_bpc'] = bpcs.mean()
     model.train()
     return out
 
@@ -263,7 +267,10 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if dataset == "enwik8_char":
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, bpc_test {losses['test_bpc']:.4f}")
+        else:
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -274,6 +281,7 @@ while True:
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
+            test_bpc = losses['test_bpc'] if 'test_bpc' in losses else None
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -281,6 +289,7 @@ while True:
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
+                    'test_bpc': test_bpc,
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
