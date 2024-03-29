@@ -31,7 +31,7 @@ assert len(chars) == 205
 
 # create dictionaries
 stoi = {str(ch): i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
+itos = {i: str(ch) for i, ch in enumerate(chars)}
 
 
 def encode(ascii):

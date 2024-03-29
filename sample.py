@@ -11,7 +11,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = '\n' # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
@@ -64,8 +64,16 @@ if load_meta:
         meta = pickle.load(f)
     # TODO want to make this more general to arbitrary encoder/decoder schemes
     stoi, itos = meta['stoi'], meta['itos']
+    
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
+    
+    if meta_path == "data/enwik8_char/meta.pkl":
+        encode = lambda s: [stoi[s] if s != "\n" else stoi["<eos>"]]  # different encoding for enwik8_char
+        def parse_ascii(a):
+            if a == "<eos>": return "\n"
+            return chr(int(a))
+        decode = lambda l: ''.join([parse_ascii(itos[i]) for i in l])
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
@@ -77,7 +85,9 @@ else:
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
+        
 start_ids = encode(start)
+print("----------->", start_ids)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation

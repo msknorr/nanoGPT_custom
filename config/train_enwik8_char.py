@@ -38,4 +38,4 @@ warmup_iters = 100 # not super necessary potentially
 
 
 # my changes 
-moe = False
+moe = True
