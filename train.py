@@ -33,26 +33,27 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 50
+log_interval = 10000000000
 eval_iters = 200  #todo: increase
+eval_iters_test = 2000
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'gptnano'
+wandb_run_name = '44params' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'enwik8_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 64
 # model
 n_layer = 12
 n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+n_embd = 504
+dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -219,9 +220,15 @@ def estimate_loss():
     model.eval()
     datasets = ['train', 'val'] if dataset != 'enwik8_char' else ['train', 'val', 'test']
     for split in datasets:
-        losses = torch.zeros(eval_iters)
-        bpcs = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        if split == 'test':
+            losses = torch.zeros(eval_iters_test)
+            bpcs = torch.zeros(eval_iters_test)
+            iters = eval_iters_test
+        else:
+            losses = torch.zeros(eval_iters)
+            bpcs = torch.zeros(eval_iters)
+            iters = eval_iters
+        for k in range(iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss, bpc = model(X, Y)
@@ -269,6 +276,7 @@ while True:
         losses = estimate_loss()
         if dataset == "enwik8_char":
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, bpc_test {losses['test_bpc']:.4f}")
+          
         else:
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -276,6 +284,7 @@ while True:
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "test/bpc": losses['test_bpc'] if 'test_bpc' in losses else "N/A",
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })

@@ -205,6 +205,7 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        print("Found blocksize:", config.block_size)
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
