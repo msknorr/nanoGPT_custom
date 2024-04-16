@@ -174,6 +174,34 @@ class SparseMoE(nn.Module):
 
         return final_output
     
+
+
+class ReconBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.mask_token = nn.Parameter(torch.randn(config.n_embd) * 0.01)
+        self.attn = CausalSelfAttention(config)
+
+    def forward(self, mask_prop, x):
+        # x.shape = (12, 64, 504)
+        x_orig = x
+        
+        mask = torch.rand(x.shape[0], x.shape[1]) < mask_prop
+        x[mask] = self.mask_token
+        
+        x = self.attn(x)
+
+        # reconstruction loss
+        #print(x.shape, x_orig.shape, x.sum(), x_orig.sum())
+        
+        losses = F.mse_loss(x, x_orig, reduction='none')
+        loss = losses[mask].mean() * 1000
+        #print(loss)
+        return loss
+
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -182,11 +210,17 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config) if not config.moe else SparseMoE(config.n_embd, num_experts=4, top_k=2)
+        self.recon_task = ReconBlock(config)
+
+
 
     def forward(self, x):
+
+        recon_loss = self.recon_task(mask_prop=0.15, x=self.ln_1(x))
+
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, recon_loss
 
 @dataclass
 class GPTConfig:
@@ -262,14 +296,18 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        recon_losses = 0
         for block in self.transformer.h:
-            x = block(x)
+            x, recon_loss = block(x)
+            recon_losses += recon_loss
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) + recon_losses
             bpc = loss / torch.log(torch.tensor(2.0))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
