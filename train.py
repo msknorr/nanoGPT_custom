@@ -41,7 +41,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = True # disabled by default
+wandb_log = False # disabled by default
 wandb_project = 'gptnano'
 wandb_run_name = '128blocksize' # 'run' + str(time.time())
 # data
@@ -222,23 +222,23 @@ def estimate_loss():
     for split in datasets:
         if split == 'test':
             losses = torch.zeros(eval_iters_test)
-            losses2 = torch.zeros(eval_iters_test)
+           # losses2 = torch.zeros(eval_iters_test)
             bpcs = torch.zeros(eval_iters_test)
             iters = eval_iters_test
         else:
             losses = torch.zeros(eval_iters)
-            losses2 = torch.zeros(eval_iters)
+           # losses2 = torch.zeros(eval_iters)
             bpcs = torch.zeros(eval_iters)
             iters = eval_iters
         for k in range(iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, loss2, bpc = model(X, Y)
+                logits, loss, bpc = model(X, Y)
             losses[k] = loss.item()
-            losses2[k] = loss2#.item()
+#            losses2[k] = loss2#.item()
             bpcs[k] = bpc.item()
         out[split] = losses.mean()
-        out[split + '_loss2'] = losses2.mean()
+       # out[split + '_loss2'] = losses2.mean()
         out[split + '_bpc'] = bpcs.mean()
     model.train()
     return out
@@ -321,9 +321,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, loss2, bpc = model(X, Y)
+            logits, loss, bpc = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-            loss2 = loss2 / gradient_accumulation_steps
+           # loss2 = loss2 / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -346,7 +346,6 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
 
-
         #lossf2 = loss2.item() * gradient_accumulation_steps
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
@@ -355,7 +354,7 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
     iter_num += 1
     local_iter_num += 1
-
+    
     # termination conditions
     if iter_num > max_iters:
         break

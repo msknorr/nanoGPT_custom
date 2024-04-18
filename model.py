@@ -26,9 +26,11 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+
+class SelfAttention(nn.Module):
+
+    def __init__(self, config, causal):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -44,12 +46,11 @@ class CausalSelfAttention(nn.Module):
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = False #hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            mask = torch.tril(torch.ones(config.block_size, config.block_size))
+            self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
+        self.is_causal = causal
 
-    def forward(self, x, xa=None):
+    def forward(self, x, xa=None, is_causal=False):
         B, T, C = x.size()
 
         if xa is not None:
@@ -64,76 +65,25 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.is_causal)
         else:
-            # manual implementation of attention
+            # Manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if self.is_causal:
+                mask = self.causal_mask[:,:,:T,:T]  # Ensure the mask is the right size for the input
+                att = att.masked_fill(mask == 0, float('-inf'))
+
+            print(att[0][0])
+            awdawdwad
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v
+            
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
-    
-
-class SuperCausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False #hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.tril(torch.ones(config.block_size, config.block_size), diagonal=-1)  # -1 excludes diagonal
-            mask[0, 0] = 1
-            self.register_buffer("bias", mask.view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x, xa=None):
-        B, T, C = x.size()
-
-        if xa is not None:
-            q = self.c_attn(x)[:, :, :self.n_embd]
-            k, v = self.c_attn(xa)[:, :, self.n_embd:].chunk(2, dim=2)
-        else:
-            q, k, v = self.c_attn(x).chunk(3, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-     
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-
-        if torch.isnan(y).sum() !=0:
-            print(y)
-            awdawd
 
         return y
 
@@ -153,145 +103,27 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-class NoisyTopkRouter(nn.Module):
-    # https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
-    def __init__(self, n_embed, num_experts, top_k):
-        super(NoisyTopkRouter, self).__init__()
-        self.top_k = top_k
-        #layer for router logits
-        self.topkroute_linear = nn.Linear(n_embed, num_experts)
-        self.noise_linear =nn.Linear(n_embed, num_experts)
-
-    def forward(self, mh_output):
-        # mh_ouput is the output tensor from multihead self attention block
-        logits = self.topkroute_linear(mh_output)
-
-        #Noise logits
-        noise_logits = self.noise_linear(mh_output)
-
-        #Adding scaled unit gaussian noise to the logits
-        noise = torch.randn_like(logits)*F.softplus(noise_logits)
-        noisy_logits = logits + noise
-
-        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
-        zeros = torch.full_like(noisy_logits, float('-inf'))
-        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)
-        return router_output, indices
-
-class Expert(nn.Module):
-    """ An MLP is a simple linear layer followed by a non-linearity i.e. each Expert """
-
-    def __init__(self, n_embed):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
-            nn.ReLU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(0.1),  # as per the original implementation: https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
-        )
-
-    def forward(self, x):
-        return self.net(x)
-    
-class SparseMoE(nn.Module):
-    # https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
-    def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
-        super(SparseMoE, self).__init__()
-        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
-        self.experts = nn.ModuleList([Expert(n_embed) for _ in range(num_experts)])
-        self.top_k = top_k
-        self.capacity_factor = capacity_factor
-        self.num_experts = num_experts
-    
-    def forward(self, x):
-    # Assuming x has shape [batch_size, seq_len, n_embd]
-        batch_size, seq_len, _ = x.shape
-        gating_output, indices = self.router(x)
-        final_output = torch.zeros_like(x)
-
-        # Flatten the batch and sequence dimensions to treat each token independently
-        flat_x = x.view(-1, x.size(-1))  
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-
-        tokens_per_batch = batch_size * seq_len * self.top_k
-        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
-
-        updates = torch.zeros_like(flat_x)
-
-        for i, expert in enumerate(self.experts):
-            expert_mask = (indices == i).any(dim=-1)
-            flat_mask = expert_mask.view(-1)
-            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
-            if limited_indices.numel() > 0:
-                expert_input = flat_x[limited_indices]
-                expert_output = expert(expert_input)
-                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-                weighted_output = expert_output * gating_scores
-                updates.index_add_(0, limited_indices, weighted_output)
-
-        # Reshape updates to match the original dimensions of x
-        final_output += updates.view(batch_size, seq_len, -1)
-
-        return final_output
-    
-
-
-class ReconBlock(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.mask_token = nn.Parameter(torch.randn(config.n_embd) * 0.01)
-        self.norm = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = SuperCausalSelfAttention(config)
-        self.mlp = MLP(config)
-
-    def forward(self, mask_prop, x, xa):
-        assert torch.isnan(x).sum() == 0
-        # x.shape = (12, 64, 504)
-        x_orig = x
-        
-        mask = torch.rand(x.shape[0], x.shape[1]) < mask_prop
-        mask[:, 0] = False
-
-        x[mask] = self.mask_token
-
-        x = x + self.attn(x, xa)
-        x = x + self.mlp(self.norm(x))
-
-        x = x[mask].reshape(-1, x.shape[-1])
-        x_orig = x_orig[mask].reshape(-1, x_orig.shape[-1])
-
-        cos_sim_loss = 1 - F.cosine_similarity(x, x_orig, dim=-1).mean()
-
-        #print(cos_sim_loss)
-        return cos_sim_loss
+   
 
 
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, causal=False):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = SelfAttention(config, causal=causal)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config) if not config.moe else SparseMoE(config.n_embd, num_experts=4, top_k=2)
-        #self.recon_task = ReconBlock(config)
+        self.mlp = MLP(config)
+        self.causal = causal    
 
 
-
-    def forward(self, x, xa=None, mask_prop=0.0):
-        #if mask_prop > 0:
-        #    recon_loss = self.recon_task(mask_prop=mask_prop, x=x, xa=xa)
-      #  else:
-        #    recon_loss = 0
-        
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, xa=None):
+        x = x + self.attn(self.ln_1(x), xa=xa)
         x = x + self.mlp(self.ln_2(x))
-        return x#, recon_loss
+        return x
+
+
 
 @dataclass
 class GPTConfig:
@@ -313,13 +145,25 @@ class GPT(nn.Module):
         print("Found blocksize:", config.block_size)
         self.config = config
 
+        # ENCODER
         self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+
+        # DECODER
+        self.transformer_decoder = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -368,23 +212,10 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        #recon_losses = 0
-        #activations = []
         for ii, block in enumerate(self.transformer.h):
-
-            #if not self.training:
-            x = block(x, mask_prop=0.0)
-#
-            #elif ii % 2 == 0 and ii > 0:        
-            #    x, recon_loss = block(x, activations[ii-2], mask_prop=0.15)
-            #    recon_losses += recon_loss
-            #else:
-            #    x, _ = block(x, mask_prop=0.0)
-
-            #activations.append(x)
-
+            x = block(x)
         
-
+        
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -397,8 +228,18 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
-        recon_losses = 0
-        return logits, loss, recon_losses, bpc
+        
+        return logits, loss, bpc
+
+
+
+
+
+#####################################################################################################################################################
+    
+
+
+
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -536,3 +377,129 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+
+
+
+
+
+"""
+class NoisyTopkRouter(nn.Module):
+    # https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
+    def __init__(self, n_embed, num_experts, top_k):
+        super(NoisyTopkRouter, self).__init__()
+        self.top_k = top_k
+        #layer for router logits
+        self.topkroute_linear = nn.Linear(n_embed, num_experts)
+        self.noise_linear =nn.Linear(n_embed, num_experts)
+
+    def forward(self, mh_output):
+        # mh_ouput is the output tensor from multihead self attention block
+        logits = self.topkroute_linear(mh_output)
+
+        #Noise logits
+        noise_logits = self.noise_linear(mh_output)
+
+        #Adding scaled unit gaussian noise to the logits
+        noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        noisy_logits = logits + noise
+
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = F.softmax(sparse_logits, dim=-1)
+        return router_output, indices"""
+
+"""class Expert(nn.Module):
+   #An MLP is a simple linear layer followed by a non-linearity i.e. each Expert
+
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(0.1),  # as per the original implementation: https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+class SparseMoE(nn.Module):
+    # https://github.com/AviSoori1x/makeMoE/blob/main/makeMoE.py
+    def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
+        super(SparseMoE, self).__init__()
+        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
+        self.experts = nn.ModuleList([Expert(n_embed) for _ in range(num_experts)])
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.num_experts = num_experts
+    
+    def forward(self, x):
+    # Assuming x has shape [batch_size, seq_len, n_embd]
+        batch_size, seq_len, _ = x.shape
+        gating_output, indices = self.router(x)
+        final_output = torch.zeros_like(x)
+
+        # Flatten the batch and sequence dimensions to treat each token independently
+        flat_x = x.view(-1, x.size(-1))  
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+
+        tokens_per_batch = batch_size * seq_len * self.top_k
+        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
+
+        updates = torch.zeros_like(flat_x)
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (indices == i).any(dim=-1)
+            flat_mask = expert_mask.view(-1)
+            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
+            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
+            if limited_indices.numel() > 0:
+                expert_input = flat_x[limited_indices]
+                expert_output = expert(expert_input)
+                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+                updates.index_add_(0, limited_indices, weighted_output)
+
+        # Reshape updates to match the original dimensions of x
+        final_output += updates.view(batch_size, seq_len, -1)
+
+        return final_output"""
+
+
+
+
+
+"""class ReconBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.mask_token = nn.Parameter(torch.randn(config.n_embd) * 0.01)
+        self.norm = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = SuperCausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, mask_prop, x, xa):
+        assert torch.isnan(x).sum() == 0
+        # x.shape = (12, 64, 504)
+        x_orig = x
+        
+        mask = torch.rand(x.shape[0], x.shape[1]) < mask_prop
+        mask[:, 0] = False
+
+        x[mask] = self.mask_token
+
+        x = x + self.attn(x, xa)
+        x = x + self.mlp(self.norm(x))
+
+        x = x[mask].reshape(-1, x.shape[-1])
+        x_orig = x_orig[mask].reshape(-1, x_orig.shape[-1])
+
+        cos_sim_loss = 1 - F.cosine_similarity(x, x_orig, dim=-1).mean()
+
+        #print(cos_sim_loss)
+        return cos_sim_loss"""
+
