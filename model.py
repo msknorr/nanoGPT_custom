@@ -136,6 +136,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     moe: bool = False
 
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -159,7 +160,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
@@ -212,10 +213,20 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
+        xa = x
+
+        # run encoder with full context size
+        activations = []
         for ii, block in enumerate(self.transformer.h):
-            x = block(x)
+            xa = block(xa)
+            activations.append(xa)
+
+        # run decoder with full context size
+        for ii, block in enumerate(self.transformer_decoder.h):
+            x = block(x, activations[-1])
+
         
-        
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
