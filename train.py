@@ -34,29 +34,29 @@ from model import GPTConfig, GPT
 # I/O
 out_dir = 'out'
 eval_interval = 50
-log_interval = 10000000
+log_interval = 1
 eval_iters = 200  #todo: increase
 eval_iters_test = 2000
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'gptnano'
-wandb_run_name = 'testAttn' # 'run' + str(time.time())
+wandb_run_name = '128blocksize' # 'run' + str(time.time())
 # data
 dataset = 'enwik8_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 64
+block_size = 128
 # model
 n_layer = 12
 n_head = 12
 n_embd = 504
-dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
+dropout = 0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 6e-3 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -222,19 +222,23 @@ def estimate_loss():
     for split in datasets:
         if split == 'test':
             losses = torch.zeros(eval_iters_test)
+            losses2 = torch.zeros(eval_iters_test)
             bpcs = torch.zeros(eval_iters_test)
             iters = eval_iters_test
         else:
             losses = torch.zeros(eval_iters)
+            losses2 = torch.zeros(eval_iters)
             bpcs = torch.zeros(eval_iters)
             iters = eval_iters
         for k in range(iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, bpc = model(X, Y)
+                logits, loss, loss2, bpc = model(X, Y)
             losses[k] = loss.item()
+            losses2[k] = loss2#.item()
             bpcs[k] = bpc.item()
         out[split] = losses.mean()
+        out[split + '_loss2'] = losses2.mean()
         out[split + '_bpc'] = bpcs.mean()
     model.train()
     return out
@@ -282,6 +286,7 @@ while True:
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
+               # "train/recon_loss": losses['train'],
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "test/bpc": losses['test_bpc'] if 'test_bpc' in losses else "N/A",
@@ -316,8 +321,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, bpc = model(X, Y)
+            logits, loss, loss2, bpc = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            loss2 = loss2 / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -339,11 +345,14 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+
+
+        #lossf2 = loss2.item() * gradient_accumulation_steps
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
     iter_num += 1
     local_iter_num += 1
 
