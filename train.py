@@ -43,11 +43,12 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'gptnano'
-wandb_run_name = '128blocksize' # 'run' + str(time.time())
+wandb_run_name = 'mixture' # 'run' + str(time.time())
+cross_attn = True
 # data
 dataset = 'enwik8_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 128
 # model
 n_layer = 12
@@ -56,7 +57,7 @@ n_embd = 504
 dropout = 0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-3 # max learning rate
+learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -147,7 +148,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, moe=moe) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, cross_attn=cross_attn) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -156,7 +157,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = GPT(gptconf)  # <-----------------------------------------------------------------------------------------
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -233,7 +234,7 @@ def estimate_loss():
         for k in range(iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, bpc = model(X, Y)
+                logits, loss, bpc, max_indices_final_block = model(X, Y)
             losses[k] = loss.item()
 #            losses2[k] = loss2#.item()
             bpcs[k] = bpc.item()
@@ -321,7 +322,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, bpc = model(X, Y)
+            logits, loss, bpc, max_indices_final_block = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
            # loss2 = loss2 / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
@@ -351,7 +352,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
+        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, activations: {max_indices_final_block} time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
     iter_num += 1
     local_iter_num += 1
     

@@ -50,17 +50,21 @@ class SelfAttention(nn.Module):
             self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
         self.is_causal = causal
 
-    def forward(self, x, xa=None, is_causal=False):
+    def forward(self, x, xa=None):
         B, T, C = x.size()
 
+        #print("self attention" if xa is None else "cross attention")
         if xa is not None:
+            _, S, _ = xa.size()
             q = self.c_attn(x)[:, :, :self.n_embd]
             k, v = self.c_attn(xa)[:, :, self.n_embd:].chunk(2, dim=2)
         else:
             q, k, v = self.c_attn(x).chunk(3, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            S = T
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+       # print("q", q.shape, "k", k.shape, "v", v.shape)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -72,9 +76,7 @@ class SelfAttention(nn.Module):
             if self.is_causal:
                 mask = self.causal_mask[:,:,:T,:T]  # Ensure the mask is the right size for the input
                 att = att.masked_fill(mask == 0, float('-inf'))
-
-            print(att[0][0])
-            awdawdwad
+           # print("---", att[0][0].shape)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
@@ -106,35 +108,73 @@ class MLP(nn.Module):
    
 
 
-
-class Block(nn.Module):
-
+"""class Block(nn.Module):
     def __init__(self, config, causal=False):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = SelfAttention(config, causal=causal)
+        self.ln_cross = LayerNorm(config.n_embd, bias=config.bias)  # New LayerNorm for cross-attention
+        self.cross_attn = SelfAttention(config, causal=False)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.causal = causal    
 
+    def forward(self, x, xa=None):
+        x = x + self.attn(self.ln_1(x))
+       
+        if xa is not None:
+            x = x + self.cross_attn(self.ln_cross(x), xa=xa)  # Use ln_cross before cross-attention
+           # awdawdawd
+        x = x + self.mlp(self.ln_2(x))
+        return x"""
+
+import torch.nn.functional as F
+
+class Block(nn.Module):
+    def __init__(self, config, causal=False):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = SelfAttention(config, causal=causal)
+        self.ln_cross = LayerNorm(config.n_embd, bias=config.bias)
+        self.cross_attn = SelfAttention(config, causal=False)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+        self.router = nn.Linear(config.n_embd, 1)  # Scoring function for selecting the layer
+        self.causal = causal    
 
     def forward(self, x, xa=None):
-        x = x + self.attn(self.ln_1(x), xa=xa)
+        x = x + self.attn(self.ln_1(x))
+        max_index = None
+
+        if xa is not None:
+            xa = torch.stack(xa, dim=1)  # --> (B, L, T, C)   # 16, 12, 64, 504
+            xa = self.ln_cross(xa)
+            scores = self.router(xa) # [16, 12, 64, 1])
+            scores = scores.mean(dim=2).squeeze(-1)  # --> (B, L)
+            scores = F.softmax(scores, dim=1)  # Softmax over layers to create a probability distribution
+
+
+            diversity_loss = -torch.mean(torch.sum(scores * torch.log(scores + 1e-6), dim=1))  # Entropy loss
+
+            _, max_index = torch.max(scores, dim=1)
+            selected_xa = xa[torch.arange(xa.size(0)), max_index]
+                             
+            x = x + self.cross_attn(self.ln_cross(x), xa=selected_xa)
+
         x = x + self.mlp(self.ln_2(x))
-        return x
 
-
+        return x, max_index
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 1024  # block size will be split among encoder and decoder. Encoder gets half, decoder half.
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    moe: bool = False
+    cross_attn: bool = False # whether to use the cross-attention mechanism in the decoder
 
 
 class GPT(nn.Module):
@@ -144,23 +184,28 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         print("Found blocksize:", config.block_size)
+        print("found atention", config.cross_attn)
         self.config = config
+
+
+        block_size_encoder = config.block_size // 2
+        block_size_decoder = config.block_size // 2
 
         # ENCODER
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(block_size_encoder, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, causal=False) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         # DECODER
         self.transformer_decoder = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(block_size_decoder, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
+            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
@@ -206,41 +251,60 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t//2, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        targets = targets[:, t//2:].contiguous() if targets is not None else None
+
+
+        # ENCODER
+        idx_encoder = idx[:, :t//2]
+        tok_emb = self.transformer.wte(idx_encoder) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x0 = self.transformer.drop(tok_emb + pos_emb)
 
-        xa = x
 
-        # run encoder with full context size
-        activations = []
-        for ii, block in enumerate(self.transformer.h):
-            xa = block(xa)
-            activations.append(xa)
+        # DECODER 
+        idx_decoder = idx[:, t//2:]
+        tok_emb = self.transformer_decoder.wte(idx_decoder) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer_decoder.wpe(pos)
+        x1 = self.transformer_decoder.drop(tok_emb + pos_emb)
+
+        max_indices_final_block = None
+        if self.config.cross_attn:
+            # run encoder with full context size
+            
+            activations = []
+            for ii, block in enumerate(self.transformer.h):
+                x0, _ = block(x0)
+                activations.append(x0)
+
 
         # run decoder with full context size
+        max_indices_final_block = []
         for ii, block in enumerate(self.transformer_decoder.h):
-            x = block(x, activations[-1])
+            x1, max_index = block(x1, activations) if self.config.cross_attn else block(x1)
+            if ii == self.config.n_layer - 1:
+                max_indices_final_block = max_index
 
         
+        x1 = self.transformer.ln_f(x1)
 
-        x = self.transformer.ln_f(x)
 
+        
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x1)
+
+            #qQSQ
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #+ recon_losses
             bpc = loss / torch.log(torch.tensor(2.0))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x1[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
         
-        return logits, loss, bpc
+        return logits, loss, bpc, max_indices_final_block
 
 
 
