@@ -28,6 +28,38 @@ class LayerNorm(nn.Module):
 
 
 
+def kl_divergence_uniformity_loss(input_tensor, num_classes=7):
+    
+    # input_tensor: [batch_size, *] (tensor can have any shape following the batch size)
+    
+    # Flatten the input_tensor except for the batch dimension
+    input_tensor_flat = input_tensor.view(input_tensor.size(0), -1)
+
+    # Compute histograms for each class in each batch
+    # Create a range tensor of size num_classes and expand it to match batch size
+    class_range = torch.arange(num_classes).to(input_tensor.device).expand(input_tensor_flat.size(0), num_classes)
+
+    # Expand input tensor to compare each element against each class
+    input_expanded = input_tensor_flat.unsqueeze(2).expand(-1, -1, num_classes)
+
+    # Create a mask where each position marks the occurrence of the class index
+    class_mask = input_expanded == class_range.unsqueeze(1)
+
+    # Sum over the second dimension to get histogram per batch
+    histogram = class_mask.sum(1).float()
+    histogram /= histogram.sum(dim=1, keepdim=True)  # Normalize to get probability distributions
+
+    # Define the uniform distribution
+    uniform_distribution = torch.full((num_classes,), fill_value=1.0 / num_classes).to(input_tensor.device)
+
+    # Compute the KL divergence using broadcasting
+    kl_divergence = F.kl_div(uniform_distribution.log().expand_as(histogram), histogram, reduction='none').sum(dim=1)
+
+    # Return the mean KL divergence over the batch
+    return kl_divergence.mean()
+
+
+
 class SelfAttention(nn.Module):
 
     def __init__(self, config, causal):
@@ -61,9 +93,9 @@ class SelfAttention(nn.Module):
         else:
             q, k, v = self.c_attn(x).chunk(3, dim=2)
             S = T
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, S, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, S, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
        # print("q", q.shape, "k", k.shape, "v", v.shape)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -76,17 +108,34 @@ class SelfAttention(nn.Module):
             if self.is_causal:
                 mask = self.causal_mask[:,:,:T,:T]  # Ensure the mask is the right size for the input
                 att = att.masked_fill(mask == 0, float('-inf'))
-           # print("---", att[0][0].shape)
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
-            
 
+            # print(att.shape)
+
+            att = F.softmax(att, dim=-1)
+            _att = self.attn_dropout(att)
+            y = _att @ v
+            
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
 
+        if xa is not None:
+            
+            # penaltize the entropy of the attention distribution within token
+           # log_probs = torch.log(att + 1e-10)
+           # entropy = -torch.sum(att * log_probs, dim=-1)
+           # print("entropy", entropy.shape)
+            
+            # penaltize missing diversity across tokens
+            _att = att.mean(dim=1)  # mean over heads
+            # discretize
+            _att = _att.argmax(dim=-1)
+            kl_div = kl_divergence_uniformity_loss(_att, num_classes=att.size(-1))
+            
+
+            return y, att, kl_div
         return y
 
 
@@ -144,10 +193,10 @@ class Block(nn.Module):
 
     def forward(self, x, xa=None):
         x = x + self.attn(self.ln_1(x))
-        max_index = None
 
         if xa is not None:
-            xa = torch.stack(xa, dim=1)  # --> (B, L, T, C)   # 16, 12, 64, 504
+
+            """xa = torch.stack(xa, dim=1)  # --> (B, L, T, C)   # 16, 12, 64, 504
             xa = self.ln_cross(xa)
             scores = self.router(xa) # [16, 12, 64, 1])
             scores = scores.mean(dim=2).squeeze(-1)  # --> (B, L)
@@ -157,20 +206,26 @@ class Block(nn.Module):
             diversity_loss = -torch.mean(torch.sum(scores * torch.log(scores + 1e-6), dim=1))  # Entropy loss
 
             _, max_index = torch.max(scores, dim=1)
-            selected_xa = xa[torch.arange(xa.size(0)), max_index]
+            selected_xa = xa[torch.arange(xa.size(0)), max_index]"""
                              
-            x = x + self.cross_attn(self.ln_cross(x), xa=selected_xa)
-
+            #print(">>>>>>>>>>>", xa.shape, x.shape)
+            selected_xa = xa
+            act, attn, kl_div = self.cross_attn(self.ln_cross(x), xa=selected_xa)
+            x = x + act
+        
         x = x + self.mlp(self.ln_2(x))
 
-        return x, max_index
+        if xa is not None:
+            return x, attn, kl_div
+        return x
+    
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024  # block size will be split among encoder and decoder. Encoder gets half, decoder half.
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
-    n_head: int = 12
+    n_head: int = 10
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -199,16 +254,18 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config, causal=False) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        self.linear = nn.Linear(config.n_embd, config.n_embd)
 
         # DECODER
         self.transformer_decoder = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(block_size_decoder, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
+            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer//2)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
+        self.mask_emb = nn.Parameter(torch.randn(config.n_embd) * 0.01)
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -261,7 +318,13 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx_encoder) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x0 = self.transformer.drop(tok_emb + pos_emb)
+        # replace [:, -6:, :] with mask token
 
+        #print(x0.sum())
+        x0[:, -10:, :] = self.mask_emb
+        #print(x0.sum())
+        #awdwad
+        #print(x0.shape)
 
         # DECODER 
         idx_decoder = idx[:, t//2:]
@@ -269,42 +332,66 @@ class GPT(nn.Module):
         pos_emb = self.transformer_decoder.wpe(pos)
         x1 = self.transformer_decoder.drop(tok_emb + pos_emb)
 
-        max_indices_final_block = None
+
+        # ENCODER
         if self.config.cross_attn:
             # run encoder with full context size
             
             activations = []
             for ii, block in enumerate(self.transformer.h):
-                x0, _ = block(x0)
-                activations.append(x0)
+                x0 = block(x0)
+                x0_pooled = x0.mean(dim=1)  # pool across token dim
+                x0_pooled = self.linear(x0_pooled)#.reshape(b, 10, -1)
+                #print(x0_pooled.shape)
+                #awdad
+                activations.append(x0_pooled)
+            activations = torch.stack(activations, dim=1)  # (B, L, C)
 
-
-        # run decoder with full context size
-        max_indices_final_block = []
-        for ii, block in enumerate(self.transformer_decoder.h):
-            x1, max_index = block(x1, activations) if self.config.cross_attn else block(x1)
-            if ii == self.config.n_layer - 1:
-                max_indices_final_block = max_index
-
+            activations = activations[:, [2,4,6,8,10]].reshape(b, -1, self.config.n_embd)
+         
+            #wadawd
         
+        # Decoder
+        cross_attns_list = []
+        kl_divs = []
+        for ii, block in enumerate(self.transformer_decoder.h): 
+            if self.config.cross_attn and ii in [1, 3, 5]:
+                #print("--->", activations.shape, x1.shape)
+                x1, _cross_attn, kl_div = block(x1, activations) 
+                kl_divs.append(kl_div)
+
+                _cross_attn = _cross_attn.mean(dim=1)  # mean over heads
+                _cross_attn_max = _cross_attn.argmax(dim=-1)  # get layer of encoder with highest attention  --> (bs, 64)
+                #_cross_attn_max = _cross_attn_max // 100  # get the layer index
+                cross_attns_list.append(_cross_attn_max)
+            else:
+                x1 = block(x1)
+
+
         x1 = self.transformer.ln_f(x1)
 
-
-        
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x1)
-
-            #qQSQ
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #+ recon_losses
+            
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             bpc = loss / torch.log(torch.tensor(2.0))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x1[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
+            
         
-        return logits, loss, bpc, max_indices_final_block
+
+        #if self.config.cross_attn:
+        kl_div_loss = torch.stack(kl_divs).mean()
+        kl_div_loss = kl_div_loss #* kl_div_loss
+        #loss = loss+ kl_div_loss
+        # else:
+        #      kl_div_loss = None
+
+        return logits, loss, bpc, kl_div_loss, cross_attns_list
 
 
 
