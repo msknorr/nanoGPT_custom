@@ -312,7 +312,7 @@ class GPT(nn.Module):
 
         targets = targets[:, t//2:].contiguous() if targets is not None else None
 
-
+        
         # ENCODER
         idx_encoder = idx[:, :t//2]
         tok_emb = self.transformer.wte(idx_encoder) # token embeddings of shape (b, t, n_embd)

@@ -43,7 +43,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'gptnano2'
-wandb_run_name = 'encoderdecoder512' # 'run' + str(time.time())
+wandb_run_name = 'dec512' # 'run' + str(time.time())
 cross_attn = True
 # data
 dataset = 'enwik8_char'
