@@ -27,6 +27,94 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class LlamaRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            print("THIS SHOULD ONLY GET CALLED ONCE")
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+    
+class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
+    """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
+
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        self.scaling_factor = scaling_factor
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = t / self.scaling_factor
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 class SelfAttention(nn.Module):
 
@@ -44,16 +132,24 @@ class SelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False #hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            mask = torch.tril(torch.ones(config.block_size, config.block_size))
-            self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
+
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
         self.is_causal = causal
+
+        if config.pos_enc == 'rope':
+            self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                        dim=config.n_embd // config.n_head,
+                        max_position_embeddings=config.block_size,
+                        scaling_factor=1.0,
+                        base=config.rope_theta,
+                    )
+
 
     def forward(self, x, xa=None, is_causal=False):
         B, T, C = x.size()
 
-        if xa is not None:
+        if xa is not None:  # cor cross attention
             q = self.c_attn(x)[:, :, :self.n_embd]
             k, v = self.c_attn(xa)[:, :, self.n_embd:].chunk(2, dim=2)
         else:
@@ -62,26 +158,22 @@ class SelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.is_causal)
-        else:
-            # Manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            if self.is_causal:
-                mask = self.causal_mask[:,:,:T,:T]  # Ensure the mask is the right size for the input
-                att = att.masked_fill(mask == 0, float('-inf'))
+        if hasattr(self, 'rotary_emb'):
+            seq_len = k.shape[-2]
+            cos, sin = self.rotary_emb(v, seq_len)
+            k, v = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
 
-            print(att[0][0])
-            awdawdwad
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
-            
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        if self.is_causal:
+            mask = self.causal_mask[:,:,:T,:T]  # Ensure the mask is the right size for the input
+            att = att.masked_fill(mask == 0, float('-inf'))
 
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+        
         # output projection
         y = self.resid_dropout(self.c_proj(y))
 
@@ -119,8 +211,18 @@ class Block(nn.Module):
 
 
     def forward(self, x, xa=None):
-        x = x + self.attn(self.ln_1(x), xa=xa)
-        x = x + self.mlp(self.ln_2(x))
+        # LLama block https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+        
+        residual = x
+        x = self.ln_1(x)
+
+        
+        x = self.attn(x, xa=xa, is_causal=self.causal)
+        x = residual + x
+
+        x = self.ln_2(x)
+        x = self.mlp(x)
+        x = x + residual
         return x
 
 
@@ -134,7 +236,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    pos_enc: str = 'learnt' # 'learnt' or None
     moe: bool = False
+    rope_theta: float = 10000.0 
 
 class GPT(nn.Module):
 
@@ -154,14 +258,14 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
-        # DECODER
+        """# DECODER
         self.transformer_decoder = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        ))"""
 
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -210,8 +314,19 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
 
+        if self.config.pos_enc == 'learnt':
+            #print("learnt pos_enc")
+            x = self.transformer.drop(tok_emb + pos_emb)  # + pos_emb
+        elif self.config.pos_enc == None or self.config.pos_enc == 'rope':
+            #print("no pos_enc")
+            x = self.transformer.drop(tok_emb)
+        else:
+            raise ValueError("pos_enc must be 'learnt' or None")
+        
+        #print(x[0][0][0:10])#0.0313, -0.0360, -0.0087,  0.0129, -0.0308, -0.0109,  0.0340,  0.0385,
+         #0.0098,  0.0125]
+        #awdwad
         for ii, block in enumerate(self.transformer.h):
             x = block(x)
         
