@@ -155,7 +155,9 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     pos_enc: str = 'learnt' # 'learnt' or None
     moe: bool = False
-    rope_theta: float = 10000.0 
+    rope_theta: float = 10000.0
+    intermediate_layer_loss: bool = False 
+
 
 class GPT(nn.Module):
 
@@ -166,7 +168,6 @@ class GPT(nn.Module):
         print("Found blocksize:", config.block_size)
         self.config = config
 
-        # ENCODER
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -175,16 +176,13 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
-        """# DECODER
-        self.transformer_decoder = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))"""
-
-
+        if config.intermediate_layer_loss:
+            self.intermediate_heads = nn.ModuleList([nn.Linear(config.n_embd, 
+                                                               config.vocab_size, 
+                                                               bias=False) for _ in range(config.n_layer - 1)])  # last one is covered as per usual
+            reduction_factor = 0.7  # the higher the moe weight to early layers
+            self.intermediate_head_scale = list(reversed([reduction_factor**(i+1) for i in range(config.n_layer - 1)]))  # +1 because final head is covered below
+            print("Using intermediate heads with scales:", self.intermediate_head_scale)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -241,26 +239,33 @@ class GPT(nn.Module):
         else:
             raise ValueError("pos_enc must be 'learnt' or None")
         
-        #print(x[0][0][0:10])#0.0313, -0.0360, -0.0087,  0.0129, -0.0308, -0.0109,  0.0340,  0.0385,
-         #0.0098,  0.0125]
-        #awdwad
+
+        
+        losses = []
         for ii, block in enumerate(self.transformer.h):
             x = block(x)
-        
+
+            if hasattr(self, 'intermediate_heads') and ii < len(self.intermediate_heads):
+                logits = self.intermediate_heads[ii](x) if hasattr(self, 'intermediate_heads') else None
+                _loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) * self.intermediate_head_scale[ii]
+                losses.append(_loss)
         
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #+ recon_losses
-            bpc = loss / torch.log(torch.tensor(2.0))
+            _loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #+ recon_losses
+            losses.append(_loss)
+            bpc = _loss / torch.log(torch.tensor(2.0))
+            loss = torch.stack(losses).mean()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
         
+
         return logits, loss, bpc
 
 
