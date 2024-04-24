@@ -51,8 +51,10 @@ batch_size = 13 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 128
 # model
 n_layer = 12
-n_head = 12
-n_embd = 504
+n_layer_local = 6
+n_head = 10
+n_embd = 530
+n_emb_local = 200
 dropout = 0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -149,7 +151,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, moe=moe, pos_enc=pos_enc, intermediate_layer_loss=intermediate_layer_loss) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, moe=moe, pos_enc=pos_enc, intermediate_layer_loss=intermediate_layer_loss,
+                  n_layer_local = n_layer_local, n_emb_local=n_emb_local) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")

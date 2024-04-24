@@ -15,6 +15,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+def like(tensor: torch.Tensor):
+    return {'dtype': tensor.dtype, 'device': tensor.device}
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -38,18 +43,23 @@ from rotary_embedding_torch import RotaryEmbedding
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, config, causal):
+    def __init__(self, config, causal, local=False):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        
+
+
+        n_embd = config.n_emb_local if local else config.n_embd
+        assert n_embd % config.n_head == 0
+
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.n_embd = n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
 
@@ -58,12 +68,12 @@ class SelfAttention(nn.Module):
         self.is_causal = causal
 
         if config.pos_enc == 'rope':
-            self.rotary_emb = RotaryEmbedding(dim = config.n_embd // config.n_head)
+            self.rotary_emb = RotaryEmbedding(dim = n_embd // config.n_head)
 
 
     def forward(self, x, xa=None, is_causal=False):
         B, T, C = x.size()
-
+        #print("self attn:", B, T, C)
         if xa is not None:  # cor cross attention
             q = self.c_attn(x)[:, :, :self.n_embd]
             k, v = self.c_attn(xa)[:, :, self.n_embd:].chunk(2, dim=2)
@@ -99,11 +109,13 @@ class SelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, local=False):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        n_emb = config.n_emb_local if local else config.n_embd
+    
+        self.c_fc    = nn.Linear(n_emb, 4 * n_emb, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * n_emb, n_emb, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -118,12 +130,14 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, causal=False):
+    def __init__(self, config, causal=False, local=False):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = SelfAttention(config, causal=causal)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        n_embd = config.n_emb_local if local else config.n_embd
+        print("n_embd block:", n_embd)
+        self.ln_1 = LayerNorm(n_embd, bias=config.bias)
+        self.attn = SelfAttention(config, causal=causal, local=local)
+        self.ln_2 = LayerNorm(n_embd, bias=config.bias)
+        self.mlp = MLP(config, local=local)
         self.causal = causal    
 
 
@@ -149,14 +163,19 @@ class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
+    n_layer_local: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_emb_local: int = 200
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     pos_enc: str = 'learnt' # 'learnt' or None
     moe: bool = False
     rope_theta: float = 10000.0
     intermediate_layer_loss: bool = False 
+    #global_context_size: int = 5
+    patch_method: str = 'utf8'
+
 
 
 class GPT(nn.Module):
@@ -168,73 +187,151 @@ class GPT(nn.Module):
         print("Found blocksize:", config.block_size)
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        assert config.n_layer % 3 == 0
+        n_initial_layers = config.n_layer_local//2
 
-        if config.intermediate_layer_loss:
-            self.intermediate_heads = nn.ModuleList([nn.Linear(config.n_embd, 
-                                                               config.vocab_size, 
-                                                               bias=False) for _ in range(config.n_layer - 1)])  # last one is covered as per usual
-            reduction_factor = 0.7  # the higher the moe weight to early layers
-            self.intermediate_head_scale = list(reversed([reduction_factor**(i+1) for i in range(config.n_layer - 1)]))  # +1 because final head is covered below
-            print("Using intermediate heads with scales:", self.intermediate_head_scale)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_emb_local),
+            wpe = nn.Embedding(config.block_size, config.n_emb_local),
+            
+            drop = nn.Dropout(config.dropout),
+            h_initial = nn.ModuleList([Block(config, causal=True, local=True) for _ in range(n_initial_layers)]),
+            h_global = nn.ModuleList([Block(config, causal=True, local=False) for _ in range(config.n_layer)]),
+            h_final = nn.ModuleList([Block(config, causal=True, local=True) for _ in range(n_initial_layers)]),
+            ln_f = LayerNorm(config.n_emb_local, bias=config.bias),
+        ))
+        self.global_context_size = config.block_size // 6  # 6 = default patchsize
+        self.wpe_global = nn.Parameter(torch.randn(self.global_context_size, config.n_embd))
+
+        #if config.intermediate_layer_loss:
+        #    self.intermediate_heads = nn.ModuleList([nn.Linear(config.n_emb_local, config.vocab_size, bias=False) for _ in range(config.n_layer - 1)])  # last one is covered as per usual
+        #    reduction_factor = 0.7  # the higher the moe weight to early layers
+        #    self.intermediate_head_scale = list(reversed([reduction_factor**(i+1) for i in range(config.n_layer - 1)]))  # +1 because final head is covered below
+        #    print("Using intermediate heads with scales:", self.intermediate_head_scale)
+
+        self.lm_head = nn.Linear(config.n_emb_local, config.vocab_size, bias=False)
+
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
+       
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        # report number of parameters
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))  # apply special scaled init to the residual projections, per GPT-2 paper
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+
+        x = self.transformer.wte(idx)
+        
+        B, Tx, d = x.shape  # Tx = number of tokens in the sequence
+        assert Tx <= self.config.block_size
+        
+        pos = torch.arange(0, Tx, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = x + pos_emb
+
+        for block in self.transformer.h_initial:
+            x = block(x) #, log=log)
+ 
+
+        D = self.config.n_embd  # die große size
+        T = self.config.block_size  # das gleiche wie Tx (oben)
+        TG = self.global_context_size
+        P = T // TG
+
+        # if patch metho != perioic:
+        global_T = torch.full((B,), -1)
+        max_global_T = min(TG, Tx)  # context size des großen, aber nur wenn kleiner als context size des kleinen
+        global_ts = torch.full((B, max_global_T), Tx-1, device=idx.device)  # Batch*max_global_T tensor mit Tx-1 gefüllt
+        #print("global_ts:", global_ts)
+
+        stop_gen = []
+        def set_global_ts(use_global):
+            for b, use_global0 in enumerate(use_global):
+                global_ts0, = use_global0.nonzero(as_tuple=True)
+                if len(global_ts0) > TG:
+                    if targets is not None:
+                        targets[b, global_ts0[TG]:] = -1
+                    else:
+                        stop_gen.append((b, global_ts0[TG]))
+                global_ts0 = global_ts0[:TG]
+                global_T[b] = len(global_ts0)
+                assert global_T[b] <= max_global_T
+                global_ts[b, :global_T[b]] = global_ts0
+
+        
+            
+        use_global = (  # find space tokens --> bool
+            (idx < ord('0')) |
+            ((ord('9') < idx) & (idx < ord('A'))) | 
+            ((ord('Z') < idx) & (idx < ord('a'))) |
+            ((ord('z') < idx) & (idx < 0b1000_0000)) |
+            (0b1100_0000 <= idx)
+        )
+        
+        use_global[:, 1:] &= use_global[:, :-1].bitwise_not()  # True only if it was originally True and the preceding cell in the same row was False -> start positions??
+        use_global |= idx == -42 #c.BOS
+        set_global_ts(use_global)
+
+        y = x.gather(1, global_ts[:, :, None].expand(B, max_global_T, d))  # wir nehmen für die große embed size da wo unsere globalen tokens sind
+        y = torch.cat([torch.zeros(B, max_global_T, D-d, **like(x)), y], -1)  # die last dim (feature dim) wird aufgefüllt, sodass kleine dim -> großedim
+        y = y + self.wpe_global[:max_global_T]
+
+
+        for block in self.transformer.h_global:
+            y = block(y) #, log=log)
+        
+
+       # print("x.shape", x.shape, "global_ts.shape", global_ts.shape, "global_T.shape", global_T.shape, "y.shape", y.shape)
+        assert x.shape[0] == global_ts.shape[0] == global_T.shape[0] == y.shape[0]
+       
+        x = torch.stack([x0.index_add(0, ts[:Ty0], y0[:Ty0, -d:]) for x0, ts, Ty0, y0 in zip(x, global_ts, global_T, y) ])  # zurückrechnen auf small block size
+
+
+        del y
+        for block in self.transformer.h_final:
+            x = block(x) #, log=log)
+
+        x = self.transformer.ln_f(x)
+
+        losses = []
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            _loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) #+ recon_losses
+            losses.append(_loss)
+            bpc = _loss / torch.log(torch.tensor(2.0))
+            loss = torch.stack(losses).mean()
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+            bpc = None
+        
+
+        return logits, loss, bpc
+    
+
+
+
+
+        awdwad
+        #_____________________________________________________________________________
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
 
         if self.config.pos_enc == 'learnt':
-            #print("learnt pos_enc")
-            x = self.transformer.drop(tok_emb + pos_emb)  # + pos_emb
+            x = self.transformer.drop(tok_emb + pos_emb)
         elif self.config.pos_enc == None or self.config.pos_enc == 'rope':
-            #print("no pos_enc")
             x = self.transformer.drop(tok_emb)
         else:
             raise ValueError("pos_enc must be 'learnt' or None")
@@ -249,7 +346,7 @@ class GPT(nn.Module):
                 logits = self.intermediate_heads[ii](x) if hasattr(self, 'intermediate_heads') else None
                 _loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1) * self.intermediate_head_scale[ii]
                 losses.append(_loss)
-        
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -274,7 +371,25 @@ class GPT(nn.Module):
 
 #####################################################################################################################################################
     
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
 
