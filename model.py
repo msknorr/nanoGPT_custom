@@ -74,9 +74,6 @@ class SelfAttention(nn.Module):
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         if hasattr(self, 'rotary_emb'):
-            #seq_len = k.shape[-2]
-           # cos, sin = self.rotary_emb(v, seq_len)
-           # k, v = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
@@ -129,14 +126,10 @@ class Block(nn.Module):
 
     def forward(self, x, xa=None):
         # LLama block https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
-        
         residual = x
         x = self.ln_1(x)
-
-        
         x = self.attn(x, xa=xa, is_causal=self.causal)
         x = residual + x
-
         x = self.ln_2(x)
         x = self.mlp(x)
         x = x + residual
@@ -183,6 +176,8 @@ class GPT(nn.Module):
             reduction_factor = 0.7  # the higher the moe weight to early layers
             self.intermediate_head_scale = list(reversed([reduction_factor**(i+1) for i in range(config.n_layer - 1)]))  # +1 because final head is covered below
             print("Using intermediate heads with scales:", self.intermediate_head_scale)
+
+            
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -231,10 +226,8 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
 
         if self.config.pos_enc == 'learnt':
-            #print("learnt pos_enc")
-            x = self.transformer.drop(tok_emb + pos_emb)  # + pos_emb
+            x = self.transformer.drop(tok_emb + pos_emb)
         elif self.config.pos_enc == None or self.config.pos_enc == 'rope':
-            #print("no pos_enc")
             x = self.transformer.drop(tok_emb)
         else:
             raise ValueError("pos_enc must be 'learnt' or None")
@@ -260,21 +253,12 @@ class GPT(nn.Module):
             bpc = _loss / torch.log(torch.tensor(2.0))
             loss = torch.stack(losses).mean()
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
         
 
         return logits, loss, bpc
-
-
-
-
-
-#####################################################################################################################################################
-    
-
 
 
 
