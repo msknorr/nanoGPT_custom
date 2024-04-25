@@ -156,27 +156,6 @@ class MLP(nn.Module):
         return x
    
 
-
-"""class Block(nn.Module):
-    def __init__(self, config, causal=False):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = SelfAttention(config, causal=causal)
-        self.ln_cross = LayerNorm(config.n_embd, bias=config.bias)  # New LayerNorm for cross-attention
-        self.cross_attn = SelfAttention(config, causal=False)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-        self.causal = causal    
-
-    def forward(self, x, xa=None):
-        x = x + self.attn(self.ln_1(x))
-       
-        if xa is not None:
-            x = x + self.cross_attn(self.ln_cross(x), xa=xa)  # Use ln_cross before cross-attention
-           # awdawdawd
-        x = x + self.mlp(self.ln_2(x))
-        return x"""
-
 import torch.nn.functional as F
 
 class Block(nn.Module):
@@ -195,22 +174,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
 
         if xa is not None:
-
-            """xa = torch.stack(xa, dim=1)  # --> (B, L, T, C)   # 16, 12, 64, 504
-            xa = self.ln_cross(xa)
-            scores = self.router(xa) # [16, 12, 64, 1])
-            scores = scores.mean(dim=2).squeeze(-1)  # --> (B, L)
-            scores = F.softmax(scores, dim=1)  # Softmax over layers to create a probability distribution
-
-
-            diversity_loss = -torch.mean(torch.sum(scores * torch.log(scores + 1e-6), dim=1))  # Entropy loss
-
-            _, max_index = torch.max(scores, dim=1)
-            selected_xa = xa[torch.arange(xa.size(0)), max_index]"""
-                             
-            #print(">>>>>>>>>>>", xa.shape, x.shape)
-            selected_xa = xa
-            act, attn, kl_div = self.cross_attn(self.ln_cross(x), xa=selected_xa)
+            act, attn, kl_div = self.cross_attn(self.ln_cross(x), xa=xa)
             x = x + act
         
         x = x + self.mlp(self.ln_2(x))
@@ -239,7 +203,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         print("Found blocksize:", config.block_size)
-        print("found atention", config.cross_attn)
+        print("Encoder-decoder:", config.cross_attn)
         self.config = config
 
 
@@ -247,21 +211,22 @@ class GPT(nn.Module):
         block_size_decoder = config.block_size // 2
 
         # ENCODER
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(block_size_encoder, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, causal=False) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.linear = nn.Linear(config.n_embd, config.n_embd)
+        if self.config.cross_attn:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(block_size_encoder, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config, causal=False) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+            self.linear = nn.Linear(config.n_embd, config.n_embd)
 
         # DECODER
         self.transformer_decoder = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(block_size_decoder, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer//2)]),   # <-------- hier causal hin, oben weg. Dann context size zb 256, dh decoder context size ist 128 mit causal. Encoder 128 ohne causal.
+            h = nn.ModuleList([Block(config, causal=True) for _ in range(config.n_layer//2)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
@@ -272,7 +237,7 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer_decoder.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -293,7 +258,9 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            if self.config.cross_attn:
+                n_params -= self.transformer.wpe.weight.numel()
+            n_params -= self.transformer_decoder.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -309,98 +276,60 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t//2, dtype=torch.long, device=device) # shape (t)
-
         targets = targets[:, t//2:].contiguous() if targets is not None else None
-
         
-        # ENCODER
-        idx_encoder = idx[:, :t//2]
-        tok_emb = self.transformer.wte(idx_encoder) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x0 = self.transformer.drop(tok_emb + pos_emb)
-        # replace [:, -6:, :] with mask token
-
-        #print(x0.sum())
-        x0[:, -10:, :] = self.mask_emb
-        #print(x0.sum())
-        #awdwad
-        #print(x0.shape)
+        if self.config.cross_attn:
+            # ENCODER
+            idx_encoder = idx[:, :t//2]
+            tok_emb = self.transformer.wte(idx_encoder) 
+            pos_emb = self.transformer.wpe(pos) 
+            x0 = self.transformer.drop(tok_emb + pos_emb)
+            x0[:, -10:, :] = self.mask_emb
 
         # DECODER 
         idx_decoder = idx[:, t//2:]
-        tok_emb = self.transformer_decoder.wte(idx_decoder) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer_decoder.wte(idx_decoder)
         pos_emb = self.transformer_decoder.wpe(pos)
         x1 = self.transformer_decoder.drop(tok_emb + pos_emb)
 
-
         # ENCODER
         if self.config.cross_attn:
-            # run encoder with full context size
-            
             activations = []
             for ii, block in enumerate(self.transformer.h):
                 x0 = block(x0)
-                x0_pooled = x0.mean(dim=1)  # pool across token dim
-                x0_pooled = self.linear(x0_pooled)#.reshape(b, 10, -1)
-                #print(x0_pooled.shape)
-                #awdad
+                x0_pooled = x0.mean(dim=1)
+                x0_pooled = self.linear(x0_pooled)
                 activations.append(x0_pooled)
-            activations = torch.stack(activations, dim=1)  # (B, L, C)
 
+            activations = torch.stack(activations, dim=1)  # (B, L, C)
             activations = activations[:, [2,4,6,8,10]].reshape(b, -1, self.config.n_embd)
          
-            #wadawd
-        
-        # Decoder
+        # DECODER
         cross_attns_list = []
         kl_divs = []
         for ii, block in enumerate(self.transformer_decoder.h): 
             if self.config.cross_attn and ii in [1, 3, 5]:
-                #print("--->", activations.shape, x1.shape)
                 x1, _cross_attn, kl_div = block(x1, activations) 
                 kl_divs.append(kl_div)
 
                 _cross_attn = _cross_attn.mean(dim=1)  # mean over heads
-                _cross_attn_max = _cross_attn.argmax(dim=-1)  # get layer of encoder with highest attention  --> (bs, 64)
-                #_cross_attn_max = _cross_attn_max // 100  # get the layer index
+                _cross_attn_max = _cross_attn.argmax(dim=-1)
                 cross_attns_list.append(_cross_attn_max)
             else:
                 x1 = block(x1)
 
-
-        x1 = self.transformer.ln_f(x1)
+        x1 = self.transformer_decoder.ln_f(x1)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x1)
-            
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             bpc = loss / torch.log(torch.tensor(2.0))
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x1[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
             bpc = None
             
-        
-
-        #if self.config.cross_attn:
-        kl_div_loss = torch.stack(kl_divs).mean()
-        kl_div_loss = kl_div_loss #* kl_div_loss
-        #loss = loss+ kl_div_loss
-        # else:
-        #      kl_div_loss = None
-
-        return logits, loss, bpc, kl_div_loss, cross_attns_list
-
-
-
-
-
-#####################################################################################################################################################
-    
-
-
+        return logits, loss, bpc, cross_attns_list
 
 
     def crop_block_size(self, block_size):

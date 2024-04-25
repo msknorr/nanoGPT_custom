@@ -33,7 +33,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 50
+eval_interval = 2 #50
 log_interval = 1
 eval_iters = 200  #todo: increase
 eval_iters_test = 2000
@@ -41,9 +41,9 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = True # disabled by default
+wandb_log = False # disabled by default
 wandb_project = 'gptnano2'
-wandb_run_name = 'dec512' # 'run' + str(time.time())
+wandb_run_name = 'encdec' # 'run' + str(time.time())
 cross_attn = True
 # data
 dataset = 'enwik8_char'
@@ -223,12 +223,10 @@ def estimate_loss():
     for split in datasets:
         if split == 'test':
             losses = torch.zeros(eval_iters_test)
-            losses2 = torch.zeros(eval_iters_test)
             bpcs = torch.zeros(eval_iters_test)
             iters = eval_iters_test
         else:
             losses = torch.zeros(eval_iters)
-            losses2 = torch.zeros(eval_iters)
             bpcs = torch.zeros(eval_iters)
             iters = eval_iters
 
@@ -236,24 +234,20 @@ def estimate_loss():
         for k in range(iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, bpc, kl_divs, cross_attns_list = model(X, Y)
+                logits, loss, bpc, cross_attns_list = model(X, Y)
 
-            if split == 'test' and k < 100:
-                 # letzter blokck vom decoder
-                #cross_attn = cross_attns_list[-1].detach().cpu().numpy()  # --> 16, 64
+            if split == 'test' and k < 100 and len(cross_attns_list) > 0:
                 cross_attn = torch.stack(cross_attns_list).detach().cpu().numpy()  # --> 16, 64
                 test_storage.append((cross_attn, X.detach().cpu().numpy(), Y.detach().cpu().numpy()))
             
             losses[k] = loss.item()
-            losses2[k] = kl_divs.item()
             bpcs[k] = bpc.item()
 
         if split == 'test':
-            with open('test_storage.pkl', 'wb') as f:
+            with open('test_storage2.pkl', 'wb') as f:
                 pickle.dump(test_storage, f)
 
         out[split] = losses.mean()
-       # out[split + '_loss2'] = losses2.mean()
         out[split + '_bpc'] = bpcs.mean()
     model.train()
     return out
@@ -336,9 +330,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, bpc, kl_loss, cross_attns_list = model(X, Y)
+            logits, loss, bpc, cross_attns_list = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-            loss2 = kl_loss / gradient_accumulation_steps
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -360,13 +354,11 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-
-        lossf2 = loss2.item() * gradient_accumulation_steps
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, kl_div {kl_loss:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
+        print(f"iter {iter_num}: loss {lossf:.4f}, bpc {bpc:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")  #lossrecon {lossf2:.4f},
     iter_num += 1
     local_iter_num += 1
     

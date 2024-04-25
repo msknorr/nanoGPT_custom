@@ -1,11 +1,8 @@
 import os
 import pickle
-import requests
 import numpy as np
-import os
 import urllib.request
 import zipfile
-import sys
       
 zip_path = os.path.join(os.path.dirname(__file__), 'enwik8.zip')
 if not os.path.exists(zip_path):
