@@ -76,7 +76,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 moe = False  # mixture of experts
-pos_enc = "rope" #None # "learnt"
+pos_enc = "rope" # one of None, "rope", "learnt"
 intermediate_layer_loss = True  # https://arxiv.org/pdf/1808.04444.pdf
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
